@@ -44,7 +44,7 @@ options:
     default: 300
   state:
     description:
-      - create or deregister/delete image
+      - create (present) or deregister/delete image (absent)
     required: false
     default: 'present'
   description:
@@ -61,6 +61,38 @@ options:
   image_id:
     description:
       - Image ID to be deregistered.
+    required: false
+    default: null
+  image_location:
+    version_added: "2.0"
+    description:
+      - Image location when registering an AMI.
+    required: false
+    default: null
+  architecture:
+    version_added: "2.0"
+    description:
+      - Architecture when registering an AMI.
+    required: false
+    default: x86_64
+    choices: [ "x86_64", "i386" ]
+  virtualization_type:
+    version_added: "2.0"
+    description:
+      - Virtualization type when registering an AMI.
+    required: false
+    default: hvm
+    choices: [ "paravirtual", "hvm" ]
+  kernel_id:
+    version_added: "2.0"
+    description:
+      - Kernel ID when registering an AMI.
+    required: false
+    default: null
+  root_device_name:
+    version_added: "2.0"
+    description:
+      - Root device name when registering an AMI.
     required: false
     default: null
   device_mapping:
@@ -150,6 +182,15 @@ EXAMPLES = '''
           no_device: yes
   register: instance
 
+# Register AMI
+- ec2_ami:
+    aws_access_key: xxxxxxxxxxxxxxxxxxxxxxx
+    aws_secret_key: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    name: "my_ami_name"
+    image_location: "s3_bucket/bucket_folder/my_ami_name.manifest.xml"
+    region: xxxxxx
+    state: register
+
 # Deregister/Delete AMI
 - ec2_ami:
     aws_access_key: xxxxxxxxxxxxxxxxxxxxxxx
@@ -201,6 +242,30 @@ except ImportError:
     HAS_BOTO = False
 
 
+def get_image_with_name(name, ec2):
+    """
+    Get image id with name or None
+    """
+    try_all = True
+    images = []
+    # Try to optimize the lookup through an EC2 API
+    # call, fallback to plain get_all_images, if
+    # necessary
+    try:
+        images = ec2.get_all_images(filtres={'name': name})
+        try_all = False
+    except:
+        pass
+
+    if try_all:
+        images = ec2.get_all_images()
+
+    for img in images:
+        if img.name == name:
+            return img
+    return None
+
+
 def create_image(module, ec2):
     """
     Creates new AMI
@@ -237,12 +302,12 @@ def create_image(module, ec2):
             params['block_device_mapping'] = bdm
 
         image_id = ec2.create_image(**params)
-    except boto.exception.BotoServerError, e:
+    except boto.exception.BotoServerError:
+        e = sys.exc_info()[1]
         if e.error_code == 'InvalidAMIName.Duplicate':
-            images = ec2.get_all_images()
-            for img in images:
-                if img.name == name:
-                    module.exit_json(msg="AMI name already present", image_id=img.id, state=img.state, changed=False)
+            img = get_image_with_name(name, ec2)
+            if img.name == name:
+                module.exit_json(msg="AMI name already present", image_id=img.id, state=img.state, changed=False)
             else:
                 module.fail_json(msg="Error in retrieving duplicate AMI details")
         else:
@@ -255,7 +320,8 @@ def create_image(module, ec2):
         try:
             img = ec2.get_image(image_id)
             break
-        except boto.exception.EC2ResponseError, e:
+        except boto.exception.EC2ResponseError:
+            e = sys.exc_info()[1]
             if 'InvalidAMIID.NotFound' in e.error_code and wait:
                 time.sleep(1)
             else:
@@ -275,13 +341,15 @@ def create_image(module, ec2):
     if tags:
         try:
             ec2.create_tags(image_id, tags)
-        except boto.exception.EC2ResponseError, e:
+        except boto.exception.EC2ResponseError:
+            e = sys.exc_info()[1]
             module.fail_json(msg = "Image tagging failed => %s: %s" % (e.error_code, e.error_message))
     if launch_permissions:
         try:
             img = ec2.get_image(image_id)
             img.set_launch_permissions(**launch_permissions)
-        except boto.exception.BotoServerError, e:
+        except boto.exception.BotoServerError:
+            e = sys.exc_info()[1]
             module.fail_json(msg="%s: %s" % (e.error_code, e.error_message), image_id=image_id)
 
     module.exit_json(msg="AMI creation operation complete", image_id=image_id, state=img.state, changed=True)
@@ -306,7 +374,8 @@ def deregister_image(module, ec2):
                   'delete_snapshot': delete_snapshot}
 
         res = ec2.deregister_image(**params)
-    except boto.exception.BotoServerError, e:
+    except boto.exception.BotoServerError:
+        e = sys.exc_info()[1]
         module.fail_json(msg = "%s: %s" % (e.error_code, e.error_message))
 
     # wait here until the image is gone
@@ -320,7 +389,6 @@ def deregister_image(module, ec2):
         module.fail_json(msg = "timed out waiting for image to be reregistered/deleted")
 
     module.exit_json(msg="AMI deregister/delete operation complete", changed=True)
-
 
 def update_image(module, ec2):
     """
@@ -349,14 +417,93 @@ def update_image(module, ec2):
         else:
             module.exit_json(msg="AMI not updated", launch_permissions=set_permissions, changed=False)
 
-    except boto.exception.BotoServerError, e:
+    except boto.exception.BotoServerError:
+        e = sys.exc_info()[1]
         module.fail_json(msg = "%s: %s" % (e.error_code, e.error_message))
+
+def register_image(module, ec2):
+    """
+    Registers AMI
+    """
+
+    name = module.params.get('name')
+    description = module.params.get('description')
+    image_location = module.params.get('image_location')
+    architecture = module.params.get('architecture')
+    kernel_id = module.params.get('kernel_id')
+    root_device_name = module.params.get('root_device_name')
+    virtualization_type = module.params.get('virtualization_type')
+    wait = module.params.get('wait')
+    wait_timeout = int(module.params.get('wait_timeout'))
+    device_mapping = module.params.get('device_mapping')
+
+    try:
+        params = {'name': name,
+                  'description': description,
+                  'architecture': architecture,
+                  'virtualization_type': virtualization_type}
+        if image_location:
+            params['image_location'] = image_location
+        if kernel_id:
+            params['kernel_id'] = kernel_id
+        if root_device_name:
+            params['root_device_name'] = root_device_name
+
+        if device_mapping:
+            bdm = BlockDeviceMapping()
+            for device in device_mapping:
+                if 'device_name' not in device:
+                    module.fail_json(msg = 'Device name must be set for volume')
+                device_name = device['device_name']
+                del device['device_name']
+                bd = BlockDeviceType(**device)
+                bdm[device_name] = bd
+            params['block_device_map'] = bdm
+
+        image_id = ec2.register_image(**params)
+    except boto.exception.BotoServerError:
+        e = sys.exc_info()[1]
+        if e.error_code == 'InvalidAMIName.Duplicate':
+            img = get_image_with_name(name, ec2)
+            if img.name == name:
+                module.exit_json(msg="AMI name already present", image_id=img.id, state=img.state, changed=False)
+                sys.exit(0)
+            else:
+                module.fail_json(msg="Error in retrieving duplicate AMI details")
+        else:
+            module.fail_json(msg="%s: %s" % (e.error_code, e.error_message))
+
+    # wait here until the image is gone
+    wait_timeout = time.time() + wait_timeout
+    while wait and wait_timeout > time.time():
+        try:
+            img = ec2.get_image(image_id)
+            if img is None:
+                continue
+            break
+        except boto.exception.BotoServerError:
+            e = sys.exc_info()[1]
+            if e.error_code != 'InvalidAMIID.NotFound':
+                raise
+        time.sleep(3)
+
+    if wait and wait_timeout <= time.time():
+        # waiting took too long
+        module.fail_json(msg = "timed out waiting for image to be registered")
+
+    module.exit_json(msg="AMI register operation complete", image_id=image_id, changed=True)
+    sys.exit(0)
 
 def main():
     argument_spec = ec2_argument_spec()
     argument_spec.update(dict(
             instance_id = dict(),
             image_id = dict(),
+            image_location = dict(),
+            architecture = dict(default="x86_64"),
+            kernel_id = dict(),
+            virtualization_type = dict(default="hvm"),
+            root_device_name = dict(),
             delete_snapshot = dict(),
             name = dict(),
             wait = dict(type="bool", default=False),
@@ -376,8 +523,9 @@ def main():
 
     try:
         ec2 = ec2_connect(module)
-    except Exception, e:
-        module.fail_json(msg="Error while connecting to aws: %s" % str(e))
+    except Exception:
+        e = sys.exc_info()[1]
+        module.json_fail(msg="Error while connecting to aws: %s" % str(e))
 
     if module.params.get('state') == 'absent':
         if not module.params.get('image_id'):
@@ -392,10 +540,18 @@ def main():
 
         # Changed is always set to true when provisioning new AMI
         if not module.params.get('instance_id'):
-            module.fail_json(msg='instance_id parameter is required for new image')
-        if not module.params.get('name'):
-            module.fail_json(msg='name parameter is required for new image')
-        create_image(module, ec2)
+            if not module.params.get('image_location') and not module.params.get('device_mapping'):
+                module.fail_json(msg='image_location (register from s3) or device_mapping (register from ebs snapshot) parameter is required for new image')
+
+            register_image(module, ec2)
+        else:
+            if module.params.get('image_location'):
+                module.fail_json(msg='instance_id and image_location parameters are mutually exclusive')
+
+            if not module.params.get('name'):
+                module.fail_json(msg='name parameter is required for new image')
+
+            create_image(module, ec2)
 
 
 # import module snippets
